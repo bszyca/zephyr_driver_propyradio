@@ -557,8 +557,10 @@ void nrf24l01_configure_ack(const struct device *dev)
 	if (data->payload_ack)
 	{
 		// Auto ack on enabled pipes
-		nrf24l01_write_register(dev, EN_AA,
-				GENMASK(data->rx_datapipes_number-1, 0));
+		nrf24l01_write_register(dev, EN_AA,	GENMASK(data->rx_datapipes_number-1, 0));
+		nrf24l01_set_register_bit(dev, FEATURE, EN_DPL, true);
+		nrf24l01_set_register_bit(dev, FEATURE, EN_ACK_PAY, true);
+		nrf24l01_set_register_bit(dev, DYNPD,	DPL_P0, true);
 	} else {
 		nrf24l01_write_register(dev, EN_AA, 0x00);
 	}
@@ -736,9 +738,77 @@ static int nrf24l01_write(const struct device *dev, uint8_t *buffer, uint8_t dat
 	return ret;
 }
 
+static int nrf24l01_ack_write(const struct device *dev, uint8_t* buf, uint8_t data_len)
+{
+	nrf24l01_write_ack_payload(dev, buf, data_len, 0); //pipe 0
+	return 0;
+}
+
+static int nrf24l01_ack_transceive(const struct device *dev, uint8_t* buf, uint8_t data_len)
+{
+	int ret = 0;
+#ifdef CONFIG_NRF24L01_TRIGGER
+	struct nrf24l01_data *data = dev->data;
+#else // not CONFIG_NRF24L01_TRIGGER
+	uint8_t status;
+#endif // CONFIG_NRF24L01_TRIGGER
+	LOG_DBG("Send TX");
+	nrf24l01_stop_listening(dev);
+
+	nrf24l01_write_tx_payload(dev, buf, data_len);
+	nrf24l01_toggle_ce(dev, HIGH);
+	// 10 us pulse
+	k_usleep(10);
+	nrf24l01_toggle_ce(dev, LOW);
+#ifdef CONFIG_NRF24L01_TRIGGER
+	if (k_sem_take(&data->sem, K_MSEC(CONFIG_NRF24L01_WRITE_TIMEOUT)) != 0) {
+		LOG_ERR("TX sending timed out");
+		nrf24l01_toggle_ce(dev, LOW);
+		return -ETIME;
+	}
+	ret = (int)data->write_ret_code;
+	if(ret != 0) {
+		return -EIO;
+	}
+
+	if(nrf42l01_is_rx_data_available(dev, NULL)) {
+		nrf24l01_read_payload(dev, buf, data_len);
+	}
+	else {
+		ret = -ENODATA;
+	}
+#else // not CONFIG_NRF24L01_TRIGGER
+	// Wait for status bits TX_DS or MAX_RT to be asserted
+	while( !(nrf24l01_get_register_bit(dev, NRF_STATUS, TX_DS) |
+		nrf24l01_get_register_bit(dev, NRF_STATUS, MAX_RT)))
+	{
+		k_usleep(10);
+	}
+
+	if(nrf24l01_is_rx_data_available(dev, NULL)) {
+		nrf24l01_read_payload(dev, buf, data_len);
+	}
+	else {
+		ret = -ENODATA;
+	}
+	// If max retries exceeded, flush TX
+	status = nrf24l01_read_register(dev, NRF_STATUS);
+	if ( status & BIT(MAX_RT) ) {
+		nrf24l01_cmd_register(dev, FLUSH_TX);
+		nrf24l01_clear_irq(dev);
+		return -EIO;
+	}
+	nrf24l01_clear_irq(dev);
+#endif // CONFIG_NRF24L01_TRIGGER
+
+	return ret;
+}
+
 static const struct nrf24_api nrf24l01_api = {
 	.read = nrf24l01_read,
 	.write = nrf24l01_write,
+	.ack_write = nrf24l01_ack_write,
+	.ack_transceive = nrf24l01_ack_transceive,
 };
 
 #if !defined(MINIMAL)
@@ -827,7 +897,7 @@ void work_queue_callback_handler(struct k_work *item)
 			LOG_INF("Receive ACK");
 		}
 	}
-	else if (ret & BIT(TX_DS))
+	if (ret & BIT(TX_DS))
 	{
 		LOG_DBG("TX OK!");
 		nrf24l01_toggle_ce(dev, LOW);
